@@ -1,24 +1,18 @@
-use mysql::prelude::*;
 use mysql::*;
 use rand::Rng;
 use regex::Regex;
 use snowflaked::Generator;
 use std::env;
 
-use hello::urlshorter;
-use hello::ThreadPool;
+use shorturl::url_repository;
+use shorturl::url_repository::CustomError;
+use shorturl::urlshorter;
+use shorturl::ThreadPool;
 
 use std::{
     io::{Read, Write},
     net::{TcpListener, TcpStream},
 };
-
-#[derive(FromRow)]
-struct Urls {
-    id: i64,
-    long_url: String,
-    short_url: String,
-}
 
 fn main() {
     // mysql settings
@@ -113,77 +107,64 @@ fn shorten_url(
     let id: u64 = generator.generate();
     let short_url = urlshorter::shorten(id);
 
-    match conn.exec_drop(
-        "insert into urls (id, long_url, short_url) values (:id, :long_url, :short_url)",
-        params! {
-            "id" => id,
-            "long_url" => long_url,
-            "short_url" => &short_url,
-        },
-    ) {
+    let mut url_repo = url_repository::UrlRepository { conn: conn };
+
+    match url_repo.insert(id, long_url, &short_url) {
         Ok(_) => {
             println!("the unique id: {} for {}", id, long_url);
             let response = format!("HTTP/1.1 200 OK\r\n\r\n{}\r\n", &short_url);
             stream.write(response.as_bytes()).unwrap();
             stream.flush().unwrap();
         }
-        Err(e) => {
-            let duplicate_entry = Regex::new(r"Duplicate entry").unwrap();
-            if let Some(_) = duplicate_entry.captures(&e.to_string()) {
-                match conn.exec_first::<Urls, &str, Params>(
-                    "SELECT id, long_url, short_url from urls where long_url = :long_url",
-                    params! { "long_url" => long_url},
-                ) {
-                    Ok(Some(row)) => {
-                        let response = format!("HTTP/1.1 200 OK\r\n\r\n{}\r\n", &row.short_url);
-                        stream.write(response.as_bytes()).unwrap();
-                        stream.flush().unwrap();
-                        return;
-                    }
-                    Ok(None) => {
-                        println!("something is wrong with the long_url({}) ", long_url);
-                        let response = format!("HTTP/1.1 404 Not Found\r\n\r\n");
-                        stream.write(response.as_bytes()).unwrap();
-                        stream.flush().unwrap();
-                        return;
-                    }
-                    Err(e) => {
-                        println!(
-                            "error occured while getting urls from {}\r\n{}",
-                            long_url, e
-                        );
-                        let response = format!("HTTP/1.1 503 Service Unavailable\r\n\r\n");
-                        stream.write(response.as_bytes()).unwrap();
-                        stream.flush().unwrap();
-                    }
-                }
-            } else {
+        Err(CustomError::DuplicateEntry) => match url_repo.find_by_longurl(long_url) {
+            Ok(row) => {
+                let response = format!("HTTP/1.1 200 OK\r\n\r\n{}\r\n", row.short_url);
+                stream.write(response.as_bytes()).unwrap();
+                stream.flush().unwrap();
+                return;
+            }
+            Err(CustomError::NotFound) => {
+                println!("something is wrong with the long_url({}) ", long_url);
+                let response = format!("HTTP/1.1 404 Not Found\r\n\r\n");
+                stream.write(response.as_bytes()).unwrap();
+                stream.flush().unwrap();
+                return;
+            }
+            Err(e) => {
                 println!(
-                    "failed to insert records(long_url: {}, short_url: {})\r\n{}",
-                    long_url, &short_url, e,
+                    "error occured while getting urls from {}\r\n{}",
+                    long_url, e
                 );
-
                 let response = format!("HTTP/1.1 503 Service Unavailable\r\n\r\n");
                 stream.write(response.as_bytes()).unwrap();
                 stream.flush().unwrap();
             }
+        },
+        Err(e) => {
+            println!(
+                "failed to insert records(long_url: {}, short_url: {})\r\n{}",
+                long_url, &short_url, e,
+            );
+
+            let response = format!("HTTP/1.1 503 Service Unavailable\r\n\r\n");
+            stream.write(response.as_bytes()).unwrap();
+            stream.flush().unwrap();
         }
     }
 }
 
 fn get_long_url(mut stream: TcpStream, conn: &mut PooledConn, short_url: &str) -> () {
-    match conn.exec_first::<Urls, &str, Params>(
-        "SELECT id, long_url, short_url from urls where short_url = :short_url",
-        params! { "short_url" => short_url},
-    ) {
-        Ok(Some(row)) => {
-            let response = format!("HTTP/1.1 200 OK\r\n\r\n{}\r\n", &row.short_url);
+    let mut url_repo = url_repository::UrlRepository { conn: conn };
+
+    match url_repo.find_by_shorturl(short_url) {
+        Ok(row) => {
+            let response = format!("HTTP/1.1 200 OK\r\n\r\n{}\r\n", &row.long_url);
             stream.write(response.as_bytes()).unwrap();
             stream.flush().unwrap();
             return;
         }
-        Ok(None) => {
-            println!("not found short_url({}) ", short_url);
+        Err(CustomError::NotFound) => {
+            println!("long_url not found(short_url: {}) ", short_url);
             let response = format!("HTTP/1.1 404 Not Found\r\n\r\n");
             stream.write(response.as_bytes()).unwrap();
             stream.flush().unwrap();
@@ -191,7 +172,7 @@ fn get_long_url(mut stream: TcpStream, conn: &mut PooledConn, short_url: &str) -
         }
         Err(e) => {
             println!(
-                "error occured while getting long_url from {}\r\n{}",
+                "error occured while getting urls from {}\r\n{}",
                 short_url, e
             );
             let response = format!("HTTP/1.1 503 Service Unavailable\r\n\r\n");

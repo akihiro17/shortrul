@@ -1,5 +1,5 @@
 [package]
-name = "hello"
+name = "shorturl"
 version = "0.1.0"
 edition = "2021"
 
@@ -10,3 +10,4 @@ mysql = "*"
 regex = "1.9.5"
 snowflaked = "*"
 rand = "*"
+thiserror = "1"
